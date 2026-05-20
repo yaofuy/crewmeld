@@ -1,0 +1,126 @@
+name: crewmeld
+
+# Simplified deployment compose file.
+# - No dynamic password generation (no `setup` service)
+# - No k3s / minio / ragflow / ollama profiles
+# - All values use defaults; only LLM API keys need to be supplied via optional .env
+#
+# Usage:
+#   docker compose -f docker-compose.simple.yml up -d
+#
+# Optional LLM keys: create a `.env` file at repo root with QWEN_API_KEY=... etc.
+# It will be picked up automatically (required: false).
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-crewmeld-app: &crewmeld-app
+  image: proinsight/crewmeld:${VERSION:-latest}
+  build:
+    context: .
+    dockerfile: docker/app.Dockerfile
+    args:
+      REGISTRY_MIRROR: ${REGISTRY_MIRROR:-}
+      NPM_REGISTRY: ${NPM_REGISTRY:-}
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    pull_policy: if_not_present
+    restart: unless-stopped
+    logging: *default-logging
+    expose:
+      - "5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-crewmeld}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+    volumes:
+      - crewmeld_pg_data:/var/lib/postgresql/data
+      - ./packages/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2"
+
+  redis:
+    image: redis:7-alpine
+    pull_policy: if_not_present
+    restart: unless-stopped
+    logging: *default-logging
+    expose:
+      - "6379"
+    command: >
+      redis-server
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+    volumes:
+      - crewmeld_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1"
+
+  crewmeld:
+    <<: *crewmeld-app
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "${APP_PORT:-6100}:6100"
+      - "${SOCKET_PORT:-6102}:6102"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-crewmeld}
+      - REDIS_URL=redis://redis:6379
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:6100}
+      - BETTER_AUTH_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:6100}
+      - APP_BASE_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:6100}
+      - SOCKET_SERVER_URL=http://127.0.0.1:6102
+      - NEXT_PUBLIC_SOCKET_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:6100}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:6100/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: "4"
+
+volumes:
+  crewmeld_pg_data:
+  crewmeld_redis_data:
+
+networks:
+  default:
+    name: crewmeld-network
